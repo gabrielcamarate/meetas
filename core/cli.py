@@ -32,8 +32,8 @@ import urllib.request
 from core import __version__
 from core.config import Config, get_config
 from core.daemon import (
-    AlreadyRunningError, acquire_lock, daemonize, graceful_stop, pid_alive,
-    read_pid, release_lock, wait_healthy,
+    AlreadyRunningError, acquire_lock, daemonize, graceful_stop, lock_holder,
+    release_lock, wait_healthy,
 )
 from core.logging_setup import setup_logging
 
@@ -71,8 +71,8 @@ def cmd_serve(args) -> int:
 
 def cmd_daemon(args) -> int:
     config = _cfg()
-    pid = read_pid(config)
-    if pid and pid_alive(pid):
+    pid = lock_holder(config)
+    if pid is not None:
         print(f"Already running: PID {pid}")
         return 0
     # The grandchild's stderr goes to a log file, otherwise a late crash
@@ -95,8 +95,8 @@ def cmd_stop(args) -> int:
 
 def cmd_status(args) -> int:
     config = _cfg()
-    pid = read_pid(config)
-    alive = pid is not None and pid_alive(pid)
+    pid = lock_holder(config)
+    alive = pid is not None
     health = _print_health(config)
     print(json.dumps({"pid": pid, "alive": alive, "health": health}, indent=2))
     return 0 if alive else 1

@@ -100,6 +100,28 @@ def acquire_lock(config: Config) -> None:
     _lock_fd = fd
 
 
+def lock_holder(config: Config) -> int | None:
+    """PID of the live core holding the flock on core.lock, None if no core runs.
+
+    Returns 0 when the lock is held but its PID is not written yet. Unlike
+    ``pid_alive(read_pid())`` this never mistakes a reused PID for the core.
+    """
+    try:
+        fd = os.open(config.lock_file, os.O_RDONLY | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        try:
+            return int(os.read(fd, 32).decode().strip() or "0")
+        except (ValueError, OSError):
+            return 0
+    finally:
+        os.close(fd)
+    return None
+
+
 def release_lock(config: Config) -> None:
     global _lock_fd
     for f in (config.lock_file, config.pid_file):
@@ -217,22 +239,29 @@ def wait_healthy(config: Config, timeout: float = 15.0) -> bool:
 
 
 def graceful_stop(config: Config, timeout: float = 20.0) -> bool:
-    pid = read_pid(config)
-    if not pid or not pid_alive(pid):
+    pid = lock_holder(config)
+    if pid is None:
         release_lock(config)
         return True
+    if not pid:
+        log.warning("graceful_stop_holder_unknown")
+        return False
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
         release_lock(config)
         return True
+    # Wait on the flock, not the PID: the kernel drops it as soon as the
+    # holder exits, even while it is still an unreaped zombie.
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if not pid_alive(pid):
+        if lock_holder(config) != pid:
             break
         time.sleep(0.2)
-    if pid_alive(pid):
+    holder = lock_holder(config)
+    if holder == pid:
         log.warning("graceful_stop_timeout pid=%s", pid)
         return False
-    release_lock(config)
+    if holder is None:  # keep the files of a core that already took over
+        release_lock(config)
     return True

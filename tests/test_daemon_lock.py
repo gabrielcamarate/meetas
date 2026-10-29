@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 
 from core.daemon import (
-    AlreadyRunningError, acquire_lock, read_pid, release_lock, write_pid,
+    AlreadyRunningError, acquire_lock, graceful_stop, read_pid, release_lock,
+    write_pid,
 )
 
 
@@ -72,6 +73,63 @@ def test_stale_lock_is_cleared_and_reacquired(config):
     acquire_lock(config)  # must clear the stale lock
     assert int(config.lock_file.read_text().strip()) == os.getpid()
     release_lock(config)
+
+
+def _foreign_pid_files(config, pid):
+    # Leftover core.lock/core.pid from a dead core whose PID now belongs to
+    # an unrelated live process (gabrielcamarate/Gabriel-OS#8).
+    config.lock_file.parent.mkdir(parents=True, exist_ok=True)
+    config.lock_file.write_text(str(pid))
+    write_pid(config, pid)
+
+
+def test_stop_does_not_signal_reused_pid(config):
+    other = subprocess.Popen(["sleep", "60"])
+    try:
+        _foreign_pid_files(config, other.pid)
+        assert graceful_stop(config, timeout=1) is True
+        assert other.poll() is None  # still alive: never signalled
+        assert not config.lock_file.exists()
+        assert not config.pid_file.exists()
+    finally:
+        other.kill()
+        other.wait(timeout=10)
+
+
+def test_status_and_daemon_ignore_reused_pid(config, monkeypatch):
+    import core.cli as cli
+
+    class Daemonized(Exception):
+        pass
+
+    def fake_daemonize(*a, **kw):
+        raise Daemonized
+
+    monkeypatch.setattr(cli, "_print_health", lambda config: None)
+    monkeypatch.setattr(cli, "daemonize", fake_daemonize)
+    other = subprocess.Popen(["sleep", "60"])
+    try:
+        _foreign_pid_files(config, other.pid)
+        assert cli.cmd_status(None) == 1
+        with pytest.raises(Daemonized):  # went on to start, not "Already running"
+            cli.cmd_daemon(cli.build_parser().parse_args(["daemon"]))
+    finally:
+        other.kill()
+        other.wait(timeout=10)
+
+
+def test_stop_terminates_real_holder(config):
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _HOLD_LOCK, str(config.base_dir)],
+        cwd=Path(__file__).resolve().parent.parent,
+        stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "ready"
+        assert graceful_stop(config, timeout=10) is True
+        assert holder.wait(timeout=10) is not None
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
 
 
 def test_pid_write_read_roundtrip(config):
