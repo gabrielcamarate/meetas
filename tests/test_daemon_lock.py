@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -19,15 +21,47 @@ def test_acquire_holds_our_pid(config):
     assert not config.lock_file.exists()
 
 
+_HOLD_LOCK = (
+    "import sys, time\n"
+    "from pathlib import Path\n"
+    "from core.config import Config\n"
+    "from core.daemon import acquire_lock\n"
+    "acquire_lock(Config(base_dir=Path(sys.argv[1])))\n"
+    "print('ready', flush=True)\n"
+    "time.sleep(60)\n"
+)
+
+
 def test_conflicting_live_holder_raises(config):
-    # pid 1 (systemd/init) is alive and is not us
-    config.lock_file.parent.mkdir(parents=True, exist_ok=True)
-    config.lock_file.write_text("1")
+    # Another core process really holds the lock.
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _HOLD_LOCK, str(config.base_dir)],
+        cwd=Path(__file__).resolve().parent.parent,
+        stdout=subprocess.PIPE, text=True)
     try:
-        with pytest.raises(AlreadyRunningError):
+        assert holder.stdout.readline().strip() == "ready"
+        with pytest.raises(AlreadyRunningError) as exc:
             acquire_lock(config)
+        assert exc.value.pid == holder.pid
     finally:
-        config.lock_file.unlink(missing_ok=True)
+        holder.kill()
+        holder.wait(timeout=10)
+
+
+def test_lock_naming_reused_pid_is_cleared(config):
+    # gabrielcamarate/Gabriel-OS#7: after a reboot the PID in a stale lock
+    # belonged to an unrelated live process (proton.vpn.daemon) and the core
+    # refused to start forever.
+    other = subprocess.Popen(["sleep", "60"])
+    try:
+        config.lock_file.parent.mkdir(parents=True, exist_ok=True)
+        config.lock_file.write_text(str(other.pid))
+        acquire_lock(config)
+        assert int(config.lock_file.read_text().strip()) == os.getpid()
+        release_lock(config)
+    finally:
+        other.kill()
+        other.wait(timeout=10)
 
 
 def test_stale_lock_is_cleared_and_reacquired(config):
