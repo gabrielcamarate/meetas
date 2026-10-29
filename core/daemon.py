@@ -9,10 +9,12 @@ Tauri UI. It can be:
 - controlled: `status` / `stop` / `restart`
 
 A PID + lock file in the state dir prevents double-starts and enables control.
-Stale locks (dead PID) are cleared automatically.
+The lock is an flock held for the process lifetime, so the kernel drops it when
+the holder dies; a stale file (even one naming a reused PID) never blocks.
 """
 from __future__ import annotations
 
+import fcntl
 import os
 import signal
 import sys
@@ -67,43 +69,50 @@ def write_pid(config: Config, pid: int) -> None:
         pass
 
 
+# fd holding the flock while this process owns the lock.
+_lock_fd: int | None = None
+
+
 def acquire_lock(config: Config) -> None:
-    """Take the lock; clear it if a previous holder is dead (stale)."""
+    """Take the lock with flock on a fd kept open until ``release_lock``.
+
+    Only a live process holding the flock blocks us; the PID written into the
+    file is informational, so a PID reused by an unrelated process after a
+    reboot does not count as "already running".
+    """
+    global _lock_fd
+    if _lock_fd is not None:
+        return
     config.state_dir.mkdir(parents=True, exist_ok=True)
-    lock = config.lock_file
-    for _ in range(3):
-        if lock.exists():
-            try:
-                holder = int(lock.read_text().strip() or "0")
-            except (ValueError, OSError):
-                holder = 0
-            if holder and pid_alive(holder) and holder != os.getpid():
-                raise AlreadyRunningError(holder)
-            # stale or self -> remove
-            try:
-                lock.unlink()
-            except OSError:
-                pass
+    fd = os.open(config.lock_file, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
         try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_CLOEXEC, 0o600)
-            try:
-                os.write(fd, str(os.getpid()).encode())
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            return
-        except FileExistsError:
-            continue
-    raise AlreadyRunningError(read_pid(config) or 0)
+            holder = int(os.read(fd, 32).decode().strip() or "0")
+        except (ValueError, OSError):
+            holder = 0
+        os.close(fd)
+        raise AlreadyRunningError(holder) from None
+    os.ftruncate(fd, 0)
+    os.write(fd, str(os.getpid()).encode())
+    os.fsync(fd)
+    _lock_fd = fd
 
 
 def release_lock(config: Config) -> None:
+    global _lock_fd
     for f in (config.lock_file, config.pid_file):
         try:
             if f.exists():
                 f.unlink()
         except OSError:
             pass
+    # Unlink before dropping the flock so a starter never locks a file we
+    # are about to remove.
+    if _lock_fd is not None:
+        os.close(_lock_fd)
+        _lock_fd = None
 
 
 # The first parent waits this long for the grandchild to reach a live state
